@@ -100,8 +100,8 @@ Auth = namedtuple("Auth", ["client", "creds"])
 
 
 class DropboxCredProvider(metaclass=ABCMeta):
-    DROPBOX_APP_KEY = ""
-    DROPBOX_APP_SECRET = ""
+    DROPBOX_APP_KEY = "6m0gojl32w2tiyq"
+    DROPBOX_APP_SECRET = "pp8gxp8itnwthnl"
 
     @abstractmethod
     def can_auth(self):
@@ -234,7 +234,7 @@ class FileCredProvider(DropboxCredProvider):
 
 
 def path_info_to_dropbox_path(path_info):
-    return "/" + path_info.bucket + "/" + path_info.path
+    return "/" + path_info.path
 
 
 class DropboxTree(BaseTree):
@@ -251,6 +251,10 @@ class DropboxTree(BaseTree):
     # Always prefer traverse for Dropbox since API usage quotas are a concern.
     TRAVERSE_WEIGHT_MULTIPLIER = 1
     TRAVERSE_PREFIX_LEN = 2
+    # It uses requests iter_content internally,
+    # default chunk size 1 is terribly slow. Here we use the same as defined in
+    # the http tree.
+    DOWNLOAD_CHUNK_SIZE = 2 ** 16
 
     def __init__(self, repo, config):
         super().__init__(repo, config)
@@ -304,18 +308,28 @@ class DropboxTree(BaseTree):
                 ) from ex
             raise
 
-    def exists(self, path_info, use_dvcignore=True):
+    def _get_file_metadata_no_exception(self, path_info):
         import dropbox
 
         path = path_info_to_dropbox_path(path_info)
-        logger.debug("Checking existence of {0}".format(path))
+        logger.debug("Trying to get metadata for {0}".format(path))
         try:
-            self.client.files_get_metadata(path)
-            return True
+            return self.client.files_get_metadata(path)
         except dropbox.exceptions.ApiError as ex:
             if ex.error.is_path() and ex.error.get_path().is_not_found():
-                return False
+                return None
             raise
+
+    def isdir(self, path_info):
+        from dropbox.files import FolderMetadata
+        meta = self._get_file_metadata_no_exception(path_info)
+        if meta:
+            return isinstance(meta, FolderMetadata)
+        else:
+            return False
+
+    def exists(self, path_info, use_dvcignore=True):
+        return bool(self._get_file_metadata_no_exception(path_info))
 
     def walk_files(self, path_info, **kwargs):
         """Return a generator with `PathInfo`s to all the files.
@@ -341,9 +355,7 @@ class DropboxTree(BaseTree):
         while True:
             for entry in res.entries:
                 if isinstance(entry, FileMetadata):
-                    post_bucket = entry.path_lower[len(path_info.bucket) + 1 :]
-                    replaced = path_info.replace(post_bucket)
-                    yield replaced
+                    yield path_info.replace(entry.path_lower)
             if not res.has_more:
                 break
             res = self.client.files_list_folder_continue(res.cursor)
@@ -371,29 +383,22 @@ class DropboxTree(BaseTree):
             raise
 
     def get_file_hash(self, path_info):
-        import dropbox
+        meta = self._get_file_metadata_no_exception(path_info)
 
-        path = path_info_to_dropbox_path(path_info)
-        logger.debug("Getting hash of {0}".format(path))
-        try:
-            return HashInfo(
-                self.PARAM_CHECKSUM,
-                self.client.files_get_metadata(path).content_hash,
+        if meta:
+            return HashInfo(self.PARAM_CHECKSUM, meta.content_hash)
+        else:
+            raise DvcException(
+                "Path not found for '{}':\n\n"
+                "1. Confirm the file exists and you can access it.\n"
+                "2. Make sure that credentials in '{}'\n"
+                "   are correct for this remote e.g. "
+                "use the `dropbox_user_credentials_file` config\n"
+                "   option if you use multiple Dropbox remotes with "
+                "different email accounts.\n\nDetails".format(
+                    path_info, FileCredProvider.DEFAULT_FILE
+                )
             )
-        except dropbox.exceptions.ApiError as ex:
-            if ex.error.is_path() and ex.error.get_path().is_not_found():
-                raise DvcException(
-                    "Path not found for '{}':\n\n"
-                    "1. Confirm the file exists and you can access it.\n"
-                    "2. Make sure that credentials in '{}'\n"
-                    "   are correct for this remote e.g. "
-                    "use the `dropbox_user_credentials_file` config\n"
-                    "   option if you use multiple Dropbox remotes with "
-                    "different email accounts.\n\nDetails".format(
-                        path, FileCredProvider.DEFAULT_FILE
-                    )
-                ) from ex
-            raise
 
     def _upload(
         self, from_file, to_info, name=None, no_progress_bar=False, **_kwargs
@@ -462,5 +467,5 @@ class DropboxTree(BaseTree):
         with open(to_file, "wb") as fobj, closing(res) as body, Tqdm.wrapattr(
             fobj, "write", desc=name, total=meta.size, disable=no_progress_bar
         ) as wrapped:
-            for chunk in body.iter_content():
+            for chunk in body.iter_content(chunk_size=self.DOWNLOAD_CHUNK_SIZE):
                 wrapped.write(chunk)
